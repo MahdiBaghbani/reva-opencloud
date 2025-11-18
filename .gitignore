@@ -5,7 +5,7 @@
 *.so
 *.dylib
 
-# Test binary, build with `go test -c`
+# Test binewerary, build with `go test -c`
 *.test
 
 # Visual Studio Code
