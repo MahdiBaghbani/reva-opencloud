@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 
 	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/ocm/evaluator"
 )
 
 const OCMAPIVersion = "1.2.0"
@@ -39,7 +40,9 @@ type OcmProviderConfig struct {
 	EnableWebapp       bool   `docs:"false;Whether web apps are enabled in OCM shares."                                          mapstructure:"enable_webapp"`
 	EnableDatatx       bool   `docs:"false;Whether data transfers are enabled in OCM shares."                                    mapstructure:"enable_datatx"`
 	EnableEmbedded     bool   `docs:"false;Whether embedded shares are enabled in OCM shares."                        mapstructure:"enable_embedded"`
-	EnableCodeFlow     bool   `docs:"false;Whether code-flow token exchange is enabled in OCM shares."                mapstructure:"enable_code_flow"`
+	EnableTokenExchange  bool   `docs:"false;Whether this server can perform OCM token exchange (OAuth authorization-code flow)." mapstructure:"enable_token_exchange"`
+	RequireTokenExchange bool   `docs:"false;Whether ALL incoming shares must use token exchange. Requires enable_token_exchange." mapstructure:"require_token_exchange"`
+	LegacyPeerPolicy     string `docs:"prefer-strict;How to send to peers that do not require token exchange: prefer-strict (default), legacy, or strict." mapstructure:"legacy_peer_policy"`
 }
 
 type OcmDiscoveryData struct {
@@ -49,6 +52,7 @@ type OcmDiscoveryData struct {
 	Provider           string          `json:"provider"           xml:"provider"`
 	ResourceTypes      []resourceTypes `json:"resourceTypes"      xml:"resourceTypes"`
 	Capabilities       []string        `json:"capabilities"       xml:"capabilities"`
+	Criteria           []string        `json:"criteria"           xml:"criteria"`
 	InviteAcceptDialog string          `json:"inviteAcceptDialog" xml:"inviteAcceptDialog"`
 	TokenEndPoint      string          `json:"tokenEndPoint,omitempty" xml:"tokenEndPoint,omitempty"`
 }
@@ -87,9 +91,7 @@ func (c *OcmProviderConfig) ApplyDefaults() {
 	}
 }
 
-func (h *wkocmHandler) init(c *OcmProviderConfig) {
-	// generates the (static) data structure to be exposed by /.well-known/ocm:
-	// first prepare an empty and disabled payload
+func (h *wkocmHandler) init(c *OcmProviderConfig) error {
 	c.ApplyDefaults()
 	d := &OcmDiscoveryData{}
 	d.Enabled = false
@@ -102,23 +104,31 @@ func (h *wkocmHandler) init(c *OcmProviderConfig) {
 		Protocols:  map[string]string{},
 	}}
 	d.Capabilities = []string{}
+	d.Criteria = []string{}
 
 	if c.Endpoint == "" {
 		h.data = d
-		return
+		return nil
 	}
 
 	endpointURL, err := url.Parse(c.Endpoint)
 	if err != nil {
 		h.data = d
-		return
+		return nil
 	}
 
-	// now prepare the enabled one
+	eval, err := evaluator.NewLocalEvaluator(evaluator.Config{
+		TokenExchangeEnabled: c.EnableTokenExchange,
+		RequireTokenExchange: c.RequireTokenExchange,
+		LegacyPeerPolicy:    c.LegacyPeerPolicy,
+	})
+	if err != nil {
+		return err
+	}
+
 	d.Enabled = true
 	d.Endpoint, _ = url.JoinPath(c.Endpoint, c.OCMPrefix)
 	rtProtos := map[string]string{}
-	// webdav is always enabled
 	rtProtos["webdav"] = filepath.Join(endpointURL.Path, c.WebdavRoot)
 	if c.EnableWebapp {
 		rtProtos["webapp"] = filepath.Join(endpointURL.Path, c.WebappRoot)
@@ -128,27 +138,33 @@ func (h *wkocmHandler) init(c *OcmProviderConfig) {
 	}
 	d.ResourceTypes = []resourceTypes{{
 		Name:       "file",
-		ShareTypes: []string{"user"}, // so far we only support `user`
-		Protocols:  rtProtos,         // expose the protocols as per configuration
+		ShareTypes: []string{"user"},
+		Protocols:  rtProtos,
 	}}
 	if c.EnableEmbedded {
 		d.ResourceTypes = append(d.ResourceTypes, resourceTypes{
 			Name:       "ro-crate",
 			ShareTypes: []string{"user"},
 			Protocols: map[string]string{
-				"embedded": "", // embedded resources have an empty root path by convention
+				"embedded": "",
 			},
 		})
 	}
 
-	// for now, we hardcoded the capabilities, as this is currently only advisory
 	d.Capabilities = []string{"invites", "webdav-uri", "protocol-object", "invite-wayf"}
 	d.InviteAcceptDialog, _ = url.JoinPath(c.Endpoint, c.InviteAcceptDialog)
-	if c.EnableCodeFlow {
+
+	le := eval.Evaluation()
+	if le.TokenExchangeCapable {
 		d.TokenEndPoint, _ = TokenEndpoint(c.Endpoint, c.OCMPrefix)
 		d.Capabilities = append(d.Capabilities, "exchange-token")
 	}
+	if le.RequiresTokenExchange {
+		d.Criteria = append(d.Criteria, "token-exchange")
+	}
+
 	h.data = d
+	return nil
 }
 
 // TokenEndpoint builds the advertised code-flow token endpoint for OCM discovery.
@@ -162,14 +178,16 @@ func (h *wkocmHandler) Ocm(w http.ResponseWriter, r *http.Request) {
 	log := appctx.GetLogger(r.Context())
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+
+	// Build a per-request copy so the Nextcloud user-agent compat hack
+	// does not race on h.data under concurrent requests.
+	out := *h.data
 	if r.UserAgent() == "Nextcloud Server Crawler" {
 		// Nextcloud decided to only support OCM 1.0 and 1.1, not any 1.x as per SemVer. See
 		// https://github.com/nextcloud/server/pull/39574#issuecomment-1679191188
-		h.data.APIVersion = "1.1"
-	} else {
-		h.data.APIVersion = OCMAPIVersion
+		out.APIVersion = "1.1"
 	}
-	indented, _ := json.MarshalIndent(h.data, "", "   ")
+	indented, _ := json.MarshalIndent(&out, "", "   ")
 	if _, err := w.Write(indented); err != nil {
 		log.Err(err).Msg("Error writing to ResponseWriter")
 	}

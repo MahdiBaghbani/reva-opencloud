@@ -703,3 +703,71 @@ func TestIsWebDAV401_OsPathError(t *testing.T) {
 		t.Error("expected isWebDAV401=false for PathError with non-StatusError inner")
 	}
 }
+
+func TestIsOpportunistic_CapableMarkerOnly(t *testing.T) {
+	protocols := []*ocmpb.Protocol{
+		{Term: &ocmpb.Protocol_WebdavOptions{WebdavOptions: &ocmpb.WebDAVProtocol{
+			Permissions: &ocmpb.SharePermissions{
+				Permissions: &provider.ResourcePermissions{Stat: true},
+			},
+			Requirements: []string{"__exchange-token-capable"},
+		}}},
+	}
+	if !isOpportunistic(protocols) {
+		t.Error("expected isOpportunistic=true for __exchange-token-capable only")
+	}
+}
+
+func TestIsOpportunistic_FalseWhenMustExchangePresent(t *testing.T) {
+	protocols := []*ocmpb.Protocol{
+		{Term: &ocmpb.Protocol_WebdavOptions{WebdavOptions: &ocmpb.WebDAVProtocol{
+			Permissions: &ocmpb.SharePermissions{
+				Permissions: &provider.ResourcePermissions{Stat: true},
+			},
+			Requirements: []string{"must-exchange-token", "__exchange-token-capable"},
+		}}},
+	}
+	if isOpportunistic(protocols) {
+		t.Error("expected isOpportunistic=false when must-exchange-token is present")
+	}
+}
+
+func TestIsOpportunistic_FalseWhenNoMarkers(t *testing.T) {
+	protocols := []*ocmpb.Protocol{
+		{Term: &ocmpb.Protocol_WebdavOptions{WebdavOptions: &ocmpb.WebDAVProtocol{
+			Permissions: &ocmpb.SharePermissions{
+				Permissions: &provider.ResourcePermissions{Stat: true},
+			},
+		}}},
+	}
+	if isOpportunistic(protocols) {
+		t.Error("expected isOpportunistic=false when no markers")
+	}
+}
+
+func TestIsOpportunistic_FalseForNonWebDAV(t *testing.T) {
+	protocols := []*ocmpb.Protocol{
+		{Term: &ocmpb.Protocol_WebappOptions{WebappOptions: &ocmpb.WebappProtocol{}}},
+	}
+	if isOpportunistic(protocols) {
+		t.Error("expected isOpportunistic=false for non-WebDAV")
+	}
+}
+
+// TestDiscoveryTargetDivergence documents the potential divergence between
+// ingress classification (using owner.Idp) and runtime token-endpoint discovery
+// (using the WebDAV URI host). This divergence is tracked for future alignment.
+func TestDiscoveryTargetDivergence(t *testing.T) {
+	// Ingress: shares.go classifies using owner.Idp via discoverOwner.
+	// Runtime: received/ocm.go::getTokenEndpoint extracts origin from the stored
+	// WebDAV URI (parsed.Scheme + "://" + parsed.Host).
+	// When the owner and the WebDAV host differ (e.g. CDN or proxy), these
+	// targets diverge. This test documents that gap.
+	ownerIdp := "owner.example.com"
+	webdavURI := "https://cdn.example.com/remote.php/dav/ocm/share-abc"
+
+	if ownerIdp == "cdn.example.com" {
+		t.Fatal("test setup: owner and WebDAV host must differ to document divergence")
+	}
+	_ = webdavURI
+}

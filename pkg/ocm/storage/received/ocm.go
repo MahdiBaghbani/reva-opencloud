@@ -181,6 +181,27 @@ func requiresExchange(protocols []*ocmpb.Protocol) bool {
 	return false
 }
 
+// isOpportunistic returns true when the sender supports token exchange but
+// neither the sender nor this specific share requires it. The ingress handler
+// (shares.go) marks such shares with the internal __exchange-token-capable tag
+// so that we can attempt code-flow first and fall back to plain bearer.
+func isOpportunistic(protocols []*ocmpb.Protocol) bool {
+	hasCapable := false
+	for _, p := range protocols {
+		if dav, ok := p.Term.(*ocmpb.Protocol_WebdavOptions); ok {
+			for _, r := range dav.WebdavOptions.Requirements {
+				if r == "must-exchange-token" {
+					return false
+				}
+				if r == "__exchange-token-capable" {
+					hasCapable = true
+				}
+			}
+		}
+	}
+	return hasCapable
+}
+
 func (d *driver) getTokenEndpoint(ctx context.Context, share *ocmpb.ReceivedShare) (string, error) {
 	dav, ok := getWebDAVProtocol(share.Protocols)
 	if !ok {
@@ -268,52 +289,80 @@ func (d *driver) webdavClient(ctx context.Context, ref *provider.Reference) (*go
 		return nil, nil, "", err
 	}
 
-	if !requiresExchange(share.Protocols) {
-		// legacy path: check cache first
-		if entry, err := d.ccache.Get(id.OpaqueId); err == nil {
-			cc := entry.(*cachedClient)
-			log.Info().Str("shareId", cc.share.GetId().GetOpaqueId()).Str("rel", rel).Msg("accessing OCM share via cached client")
-			return cc.client, cc.share, rel, nil
-		}
-
-		// build legacy client: try bearer (OCM v1.1+), then basic (OCM v1.0)
-		var c *gowebdav.Client
-		var authHdr string
-		bearerHdr := "Bearer " + secret
-		c = gowebdav.NewClient(endpoint, "", "")
-		c.SetHeader("Authorization", bearerHdr)
-		_, err = c.Stat("")
+	switch {
+	case requiresExchange(share.Protocols):
+		// The sender requires token exchange (either globally via discovery
+		// criteria or per-share via must-exchange-token). Always perform the
+		// OAuth code-flow; a failure here is fatal.
+		tokenEndpoint, err := d.getTokenEndpoint(ctx, share)
 		if err != nil {
-			basicHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte(secret+":"))
-			c = gowebdav.NewClient(endpoint, "", "")
-			c.SetHeader("Authorization", basicHdr)
-			_, err2 := c.Stat("")
-			if err2 != nil {
-				log.Info().Any("former_error", err).Err(err2).Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Msg("failed accessing OCM share")
-				return nil, nil, "", errtypes.InvalidCredentials("error accessing OCM share: " + err2.Error())
-			}
-			authHdr = basicHdr
-			log.Info().Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Str("mode", "legacy").Msg("access to remote OCM share succeeded")
-		} else {
-			authHdr = bearerHdr
-			log.Info().Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Str("mode", "bearer").Msg("access to remote OCM share succeeded")
+			return nil, nil, "", errors.Wrap(err, "could not discover token endpoint for code-flow share")
 		}
-
-		d.ccache.SetWithTTL(id.OpaqueId, &cachedClient{client: c, share: share, authHeader: authHdr}, time.Hour)
+		accessToken, err := d.exchangeAccessToken(ctx, share, tokenEndpoint, secret)
+		if err != nil {
+			return nil, nil, "", errors.Wrap(err, "token exchange failed")
+		}
+		c := gowebdav.NewClient(endpoint, "", "")
+		c.SetHeader("Authorization", "Bearer "+accessToken)
 		return c, share, rel, nil
+
+	case isOpportunistic(share.Protocols):
+		// The sender supports exchange but does not require it. Try code-flow
+		// first for stronger auth; if it fails, fall back to plain bearer so
+		// the share remains accessible.
+		tokenEndpoint, tErr := d.getTokenEndpoint(ctx, share)
+		if tErr == nil {
+			accessToken, xErr := d.exchangeAccessToken(ctx, share, tokenEndpoint, secret)
+			if xErr == nil {
+				c := gowebdav.NewClient(endpoint, "", "")
+				c.SetHeader("Authorization", "Bearer "+accessToken)
+				log.Info().Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Str("mode", "opportunistic-code-flow").Msg("access to remote OCM share succeeded")
+				return c, share, rel, nil
+			}
+			log.Info().Err(xErr).Str("shareId", share.GetId().GetOpaqueId()).Msg("opportunistic code-flow failed, falling back to legacy bearer")
+		} else {
+			log.Info().Err(tErr).Str("shareId", share.GetId().GetOpaqueId()).Msg("opportunistic token endpoint discovery failed, falling back to legacy bearer")
+		}
+		return d.legacyBearerClient(ctx, id, share, endpoint, secret, rel)
+
+	default:
+		// The sender does not advertise exchange at all, plain bearer only.
+		return d.legacyBearerClient(ctx, id, share, endpoint, secret, rel)
+	}
+}
+
+func (d *driver) legacyBearerClient(ctx context.Context, id *ocmpb.ShareId, share *ocmpb.ReceivedShare, endpoint, secret, rel string) (*gowebdav.Client, *ocmpb.ReceivedShare, string, error) {
+	log := appctx.GetLogger(ctx)
+
+	if entry, err := d.ccache.Get(id.OpaqueId); err == nil {
+		cc := entry.(*cachedClient)
+		log.Info().Str("shareId", cc.share.GetId().GetOpaqueId()).Str("rel", rel).Msg("accessing OCM share via cached client")
+		return cc.client, cc.share, rel, nil
 	}
 
-	// code-flow path: exchange token every time, no cache
-	tokenEndpoint, err := d.getTokenEndpoint(ctx, share)
+	var c *gowebdav.Client
+	var authHdr string
+	bearerHdr := "Bearer " + secret
+	c = gowebdav.NewClient(endpoint, "", "")
+	c.SetHeader("Authorization", bearerHdr)
+	_, err := c.Stat("")
 	if err != nil {
-		return nil, nil, "", errors.Wrap(err, "could not discover token endpoint for code-flow share")
+		basicHdr := "Basic " + base64.StdEncoding.EncodeToString([]byte(secret+":"))
+		c = gowebdav.NewClient(endpoint, "", "")
+		c.SetHeader("Authorization", basicHdr)
+		_, err2 := c.Stat("")
+		if err2 != nil {
+			log.Info().Any("former_error", err).Err(err2).Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Msg("failed accessing OCM share")
+			return nil, nil, "", errtypes.InvalidCredentials("error accessing OCM share: " + err2.Error())
+		}
+		authHdr = basicHdr
+		log.Info().Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Str("mode", "legacy").Msg("access to remote OCM share succeeded")
+	} else {
+		authHdr = bearerHdr
+		log.Info().Str("endpoint", endpoint).Str("shareId", share.GetId().GetOpaqueId()).Str("mode", "bearer").Msg("access to remote OCM share succeeded")
 	}
-	accessToken, err := d.exchangeAccessToken(ctx, share, tokenEndpoint, secret)
-	if err != nil {
-		return nil, nil, "", errors.Wrap(err, "token exchange failed")
-	}
-	c := gowebdav.NewClient(endpoint, "", "")
-	c.SetHeader("Authorization", "Bearer "+accessToken)
+
+	d.ccache.SetWithTTL(id.OpaqueId, &cachedClient{client: c, share: share, authHeader: authHdr}, time.Hour)
 	return c, share, rel, nil
 }
 
@@ -608,9 +657,9 @@ func (d *driver) Upload(ctx context.Context, ref *provider.Reference, r io.ReadC
 }
 
 // uploadAuth returns the Authorization header value for an upload attempt.
-// For code-flow shares it performs a token exchange; for legacy shares it
-// returns the cached auth header (Bearer or Basic) if available, falling
-// back to Bearer when the cache has not yet been populated.
+// For code-flow shares (strict or opportunistic) it performs a token exchange;
+// for legacy shares it returns the cached auth header (Bearer or Basic) if
+// available, falling back to Bearer when the cache has not yet been populated.
 func (d *driver) uploadAuth(ctx context.Context, share *ocmpb.ReceivedShare, endpoint, secret string, id *ocmpb.ShareId) (string, error) {
 	if requiresExchange(share.Protocols) {
 		tokenEndpoint, err := d.getTokenEndpoint(ctx, share)
@@ -623,7 +672,16 @@ func (d *driver) uploadAuth(ctx context.Context, share *ocmpb.ReceivedShare, end
 		}
 		return "Bearer " + accessToken, nil
 	}
-	// legacy: use the auth header established during the first webdavClient probe
+	if isOpportunistic(share.Protocols) {
+		tokenEndpoint, tErr := d.getTokenEndpoint(ctx, share)
+		if tErr == nil {
+			accessToken, xErr := d.exchangeAccessToken(ctx, share, tokenEndpoint, secret)
+			if xErr == nil {
+				return "Bearer " + accessToken, nil
+			}
+		}
+		// Fall through to legacy bearer.
+	}
 	if entry, err := d.ccache.Get(id.OpaqueId); err == nil {
 		return entry.(*cachedClient).authHeader, nil
 	}

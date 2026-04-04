@@ -62,7 +62,9 @@ func New(ctx context.Context, m map[string]any) (global.Service, error) {
 
 func (s *svc) routerInit() error {
 	wkocmHandler := new(wkocmHandler)
-	wkocmHandler.init(&s.Conf.OCMProvider)
+	if err := wkocmHandler.init(&s.Conf.OCMProvider); err != nil {
+		return err
+	}
 	s.router.Get("/ocm", wkocmHandler.Ocm)
 	return nil
 }

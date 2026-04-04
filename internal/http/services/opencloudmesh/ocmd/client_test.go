@@ -170,3 +170,118 @@ func TestExchangeTokenMalformedJSON(t *testing.T) {
 		t.Fatal("expected error for malformed JSON response")
 	}
 }
+
+func TestDiscoverParsesCriteria(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":       true,
+			"apiVersion":    "1.2.0",
+			"endPoint":      "https://remote/ocm",
+			"provider":      "reva",
+			"resourceTypes": []any{},
+			"capabilities":  []string{"exchange-token"},
+			"criteria":      []string{"token-exchange"},
+			"tokenEndPoint": "https://remote/ocm/token",
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(10*time.Second, true)
+	disco, err := c.Discover(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if len(disco.Criteria) != 1 || disco.Criteria[0] != "token-exchange" {
+		t.Errorf("criteria: got %v, want [token-exchange]", disco.Criteria)
+	}
+}
+
+func TestDiscoverParsesEmptyCriteria(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":       true,
+			"apiVersion":    "1.2.0",
+			"endPoint":      "https://remote/ocm",
+			"provider":      "reva",
+			"resourceTypes": []any{},
+			"capabilities":  []string{},
+			"criteria":      []string{},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(10*time.Second, true)
+	disco, err := c.Discover(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if disco.Criteria == nil {
+		t.Fatal("criteria must not be nil")
+	}
+	if len(disco.Criteria) != 0 {
+		t.Errorf("criteria: got %v, want []", disco.Criteria)
+	}
+}
+
+func TestDiscoverMissingCriteriaKeyDefaultsToNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":       true,
+			"apiVersion":    "1.2.0",
+			"endPoint":      "https://remote/ocm",
+			"provider":      "reva",
+			"resourceTypes": []any{},
+			"capabilities":  []string{},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(10*time.Second, true)
+	disco, err := c.Discover(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	// Missing key unmarshals to nil; callers should treat nil as empty.
+	if len(disco.Criteria) != 0 {
+		t.Errorf("criteria: got %v, want nil/empty", disco.Criteria)
+	}
+}
+
+func TestDiscoverFallsBackToOcmProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/ocm" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/ocm-provider" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"enabled":       true,
+				"apiVersion":    "1.1.0",
+				"endPoint":      "https://remote/ocm",
+				"provider":      "legacy-reva",
+				"resourceTypes": []any{},
+				"capabilities":  []string{},
+				"criteria":      []string{"token-exchange"},
+			})
+			return
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewClient(10*time.Second, true)
+	disco, err := c.Discover(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Discover returned error: %v", err)
+	}
+	if disco.Provider != "legacy-reva" {
+		t.Errorf("provider: got %q, want legacy-reva", disco.Provider)
+	}
+	if len(disco.Criteria) != 1 || disco.Criteria[0] != "token-exchange" {
+		t.Errorf("criteria: got %v, want [token-exchange]", disco.Criteria)
+	}
+}

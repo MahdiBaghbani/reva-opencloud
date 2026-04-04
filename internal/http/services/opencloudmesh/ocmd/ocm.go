@@ -37,6 +37,9 @@ type config struct {
 	Prefix                     string                    `mapstructure:"prefix"`
 	GatewaySvc                 string                    `mapstructure:"gatewaysvc"                    validate:"required"`
 	ExposeRecipientDisplayName bool                      `mapstructure:"expose_recipient_display_name"`
+	EnableTokenExchange        bool                      `mapstructure:"enable_token_exchange"`
+	RequireTokenExchange       bool                      `mapstructure:"require_token_exchange"`
+	LegacyPeerPolicy           string                    `mapstructure:"legacy_peer_policy"`
 	TokenManager               string                    `mapstructure:"token_manager"`
 	TokenManagers              map[string]map[string]any `mapstructure:"token_managers"`
 }

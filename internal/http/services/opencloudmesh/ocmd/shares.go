@@ -40,8 +40,10 @@ import (
 
 	rpc "github.com/cs3org/go-cs3apis/cs3/rpc/v1beta1"
 	"github.com/cs3org/reva/v3/internal/http/services/reqres"
+	"github.com/cs3org/reva/v3/internal/http/services/wellknown"
 	"github.com/cs3org/reva/v3/pkg/appctx"
 	"github.com/cs3org/reva/v3/pkg/errtypes"
+	"github.com/cs3org/reva/v3/pkg/ocm/evaluator"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/todo/pool"
 	"github.com/cs3org/reva/v3/pkg/utils"
 	"github.com/go-playground/validator/v10"
@@ -53,15 +55,25 @@ var validate = validator.New()
 type sharesHandler struct {
 	gatewayClient              gateway.GatewayAPIClient
 	exposeRecipientDisplayName bool
+	localEval                  evaluator.LocalEvaluation
 }
 
 func (h *sharesHandler) init(c *config) error {
-	var err error
+	eval, err := evaluator.NewLocalEvaluator(evaluator.Config{
+		TokenExchangeEnabled: c.EnableTokenExchange,
+		RequireTokenExchange: c.RequireTokenExchange,
+		LegacyPeerPolicy:    c.LegacyPeerPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	h.localEval = eval.Evaluation()
+	h.exposeRecipientDisplayName = c.ExposeRecipientDisplayName
+
 	h.gatewayClient, err = pool.GetGatewayServiceClient(pool.Endpoint(c.GatewaySvc))
 	if err != nil {
 		return err
 	}
-	h.exposeRecipientDisplayName = c.ExposeRecipientDisplayName
 	return nil
 }
 
@@ -138,9 +150,30 @@ func (h *sharesHandler) CreateShare(w http.ResponseWriter, r *http.Request) {
 		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "error with remote owner", err)
 		return
 	}
-	protocols, legacy, err := getAndResolveProtocols(ctx, req.Protocols, owner.Idp)
+
+	// Single discovery call for both URI resolution and receiver-side classification.
+	disco, discoveryErr := discoverOwner(ctx, owner.Idp)
+	if discoveryErr != nil {
+		log.Warn().Err(discoveryErr).Str("owner_idp", owner.Idp).Msg("owner discovery failed")
+	}
+
+	protocols, legacy, err := getAndResolveProtocols(ctx, req.Protocols, owner.Idp, disco)
 	if err != nil || len(protocols) == 0 {
 		reqres.WriteError(w, r, reqres.APIErrorInvalidParameter, "error with protocols payload", err)
+		return
+	}
+
+	if err := classifyAndNormalizeRequirements(protocols, disco, discoveryErr, h.localEval.RequiresTokenExchange); err != nil {
+		apiCode := reqres.APIErrorServerError
+		if ce, ok := err.(*classificationError); ok {
+			switch ce.kind {
+			case classErrInvalidPayload, classErrPeerUnsatisfied:
+				apiCode = reqres.APIErrorInvalidParameter
+			case classErrDiscoveryFailed:
+				apiCode = reqres.APIErrorProviderError
+			}
+		}
+		reqres.WriteError(w, r, apiCode, "receiver classification failed", err)
 		return
 	}
 
@@ -243,7 +276,21 @@ func getOCMShareType(st string) ocm.RecipientType {
 	}
 }
 
-func getAndResolveProtocols(ctx context.Context, p Protocols, ownerServer string) (protos []*ocm.Protocol, legacy bool, err error) {
+// discoverOwner performs a single OCM discovery against owner.Idp and returns the
+// full response so callers can use it for both URI resolution and classification.
+// Known pre-existing concern: TLS verification is disabled (insecure=true).
+func discoverOwner(ctx context.Context, ownerServer string) (*wellknown.OcmDiscoveryData, error) {
+	log := appctx.GetLogger(ctx)
+	ocmClient := NewClient(time.Duration(10)*time.Second, true)
+	disco, err := ocmClient.Discover(ctx, "https://"+ownerServer)
+	if err != nil {
+		log.Warn().Str("sender", ownerServer).Err(err).Msg("failed to discover OCM owner")
+		return nil, err
+	}
+	return disco, nil
+}
+
+func getAndResolveProtocols(ctx context.Context, p Protocols, ownerServer string, disco *wellknown.OcmDiscoveryData) (protos []*ocm.Protocol, legacy bool, err error) {
 	protos = make([]*ocm.Protocol, 0, len(p))
 	legacy = false
 	for _, data := range p {
@@ -259,34 +306,35 @@ func getAndResolveProtocols(ctx context.Context, p Protocols, ownerServer string
 			protos = append(protos, ocmProto)
 			continue
 		}
-		// Absolute URIs should already be clean sender-owned endpoints. Validate
-		// again here so malformed values fail before any discovery-based rewriting.
 		if err := validateProtocolURI(protocolName, uri); err != nil {
 			return nil, false, err
 		}
 
-		// If the `uri` contains a hostname, use it as is
 		u, _ := url.Parse(uri)
 		if u.Host != "" {
 			protos = append(protos, ocmProto)
 			continue
 		}
-		// otherwise use as endpoint the owner's server from the payload
-		remoteRoot, err := discoverOcmRoot(ctx, ownerServer, protocolName)
+
+		if disco == nil {
+			var derr error
+			disco, derr = discoverOwner(ctx, ownerServer)
+			if derr != nil {
+				return nil, false, derr
+			}
+		}
+		remoteRoot, err := resolveProtoRoot(disco, protocolName)
 		if err != nil {
 			return nil, false, err
 		}
 		if strings.HasPrefix(uri, "/") {
-			// only take the host from remoteRoot and append the absolute uri
-			u, _ := url.Parse(remoteRoot)
-			u.Path = uri
-			uri = u.String()
+			ru, _ := url.Parse(remoteRoot)
+			ru.Path = uri
+			uri = ru.String()
 		} else if uri == "" {
-			// case of an OCM v1.0 share with no uri, use root
 			uri = remoteRoot
 			legacy = true
 		} else {
-			// relative uri
 			uri, _ = url.JoinPath(remoteRoot, uri)
 		}
 
@@ -302,30 +350,169 @@ func getAndResolveProtocols(ctx context.Context, p Protocols, ownerServer string
 	return protos, legacy, nil
 }
 
-func discoverOcmRoot(ctx context.Context, ownerServer string, proto string) (string, error) {
-	// implements the OCM discovery logic to fetch the root at the remote host that sent the share for the given proto, see
-	// https://cs3org.github.io/OCM-API/docs.html?branch=v1.1.0&repo=OCM-API&user=cs3org#/paths/~1ocm-provider/get
-	log := appctx.GetLogger(ctx)
-
-	ocmClient := NewClient(time.Duration(10)*time.Second, true)
-	ocmCaps, err := ocmClient.Discover(ctx, "https://"+ownerServer)
-	if err != nil {
-		log.Warn().Str("sender", ownerServer).Err(err).Msg("failed to discover OCM sender")
-		return "", err
-	}
-	for _, t := range ocmCaps.ResourceTypes {
+func resolveProtoRoot(disco *wellknown.OcmDiscoveryData, proto string) (string, error) {
+	for _, t := range disco.ResourceTypes {
 		protoRoot, ok := t.Protocols[proto]
 		if ok {
-			// assume the first resourceType that exposes a root is OK to use: as a matter of fact,
-			// no implementation exists yet that exposes multiple resource types with different roots.
-			u, _ := url.Parse(ocmCaps.Endpoint)
+			u, _ := url.Parse(disco.Endpoint)
 			u.Path = protoRoot
 			u.RawQuery = ""
-			log.Debug().Str("sender", ownerServer).Str("proto", proto).Str("URL", u.String()).Msg("resolved protocol URL")
 			return u.String(), nil
 		}
 	}
-
-	log.Warn().Str("sender", ownerServer).Interface("response", ocmCaps).Msg("missing protocol root")
 	return "", errtypes.NotFound(fmt.Sprintf("root not found on OCM discovery for protocol %s", proto))
+}
+
+// hasCapability checks if an OCM discovery response advertises a given capability.
+func hasCapability(disco *wellknown.OcmDiscoveryData, cap string) bool {
+	for _, c := range disco.Capabilities {
+		if c == cap {
+			return true
+		}
+	}
+	return false
+}
+
+// internalExchangeCapableMarker is a server-side-only marker stored in WebDAV
+// requirements. It MUST NOT be accepted from the wire or added to
+// validWebDAVRequirements.
+const internalExchangeCapableMarker = "__exchange-token-capable"
+
+// classificationError wraps classification failures with a category so the
+// caller can map them to the appropriate OCM response code.
+type classificationError struct {
+	kind classificationErrorKind
+	msg  string
+	err  error
+}
+
+type classificationErrorKind int
+
+const (
+	classErrInvalidPayload  classificationErrorKind = iota // sender protocol violation (400)
+	classErrPeerUnsatisfied                                // receiver policy cannot be met (400)
+	classErrDiscoveryFailed                                // upstream discovery unavailable (502)
+)
+
+func (e *classificationError) Error() string {
+	if e.err != nil {
+		return e.msg + ": " + e.err.Error()
+	}
+	return e.msg
+}
+
+func (e *classificationError) Unwrap() error { return e.err }
+
+// classifyAndNormalizeRequirements enforces receiver-side token exchange
+// policy on each incoming WebDAV protocol. It rewrites the protocol
+// requirements list in place so downstream storage (received/ocm.go) can
+// make access decisions without re-discovering the sender.
+//
+// Two inputs drive the decision:
+//
+// 1. receiverRequiresExchange: OUR "token-exchange" criteria. When true,
+//    we require code flow for all inbound shares. Per spec (IETF-RFC.md
+//    Criteria section): "Shares that do not include must-exchange-token
+//    in their protocol.webdav.requirements will be rejected."
+//
+// 2. The sender's "exchange-token" capability: whether the sender can
+//    host a tokenEndPoint. Without it, no code flow is possible and any
+//    must-exchange-token on the wire is contradictory.
+//
+// When discovery fails, shares that carry must-exchange-token are
+// rejected (we cannot verify the sender's capability); all others are
+// accepted as plain bearer.
+func classifyAndNormalizeRequirements(protocols []*ocm.Protocol, disco *wellknown.OcmDiscoveryData, discoveryErr error, receiverRequiresExchange bool) error {
+	for _, p := range protocols {
+		dav, ok := p.Term.(*ocm.Protocol_WebdavOptions)
+		if !ok {
+			continue
+		}
+		reqs := dav.WebdavOptions.Requirements
+
+		// Never trust the internal marker from the wire; it is only added
+		// server-side. The primary gate is validWebDAVRequirements in specs.go;
+		// this is a defense-in-depth strip.
+		reqs = stripRequirement(reqs, internalExchangeCapableMarker)
+
+		hasMustExchange := containsRequirement(reqs, "must-exchange-token")
+
+		if discoveryErr != nil {
+			if hasMustExchange || receiverRequiresExchange {
+				return &classificationError{
+					kind: classErrDiscoveryFailed,
+					msg:  "discovery failed and token exchange is required",
+					err:  discoveryErr,
+				}
+			}
+			dav.WebdavOptions.Requirements = reqs
+			continue
+		}
+
+		senderSupportsExchange := hasCapability(disco, "exchange-token")
+
+		if !senderSupportsExchange {
+			if receiverRequiresExchange {
+				return &classificationError{
+					kind: classErrPeerUnsatisfied,
+					msg:  "receiver requires token-exchange but sender lacks exchange-token capability",
+				}
+			}
+			if hasMustExchange {
+				return &classificationError{
+					kind: classErrInvalidPayload,
+					msg:  "share requires must-exchange-token but sender lacks exchange-token capability",
+				}
+			}
+			// No capability, no requirement: plain legacy share.
+			dav.WebdavOptions.Requirements = reqs
+			continue
+		}
+
+		// Sender has exchange-token capability. Now apply receiver policy.
+		switch {
+		case receiverRequiresExchange:
+			// We advertise token-exchange in criteria. The spec says
+			// shares without must-exchange-token "will be rejected".
+			// The sender MUST have discovered our criteria and included
+			// the requirement; if it did not, reject.
+			if !hasMustExchange {
+				return &classificationError{
+					kind: classErrInvalidPayload,
+					msg:  "receiver requires token-exchange but share omits must-exchange-token",
+				}
+			}
+		case hasMustExchange:
+			// This specific share explicitly requires exchange and the
+			// sender can honour it. Keep the requirement as-is.
+		default:
+			// The sender supports exchange but neither we nor this share
+			// demands it. Tag for opportunistic exchange: the storage
+			// layer will try code flow first and fall back to plain
+			// bearer if it fails.
+			reqs = append(reqs, internalExchangeCapableMarker)
+		}
+
+		dav.WebdavOptions.Requirements = reqs
+	}
+	return nil
+}
+
+func containsRequirement(reqs []string, r string) bool {
+	for _, v := range reqs {
+		if v == r {
+			return true
+		}
+	}
+	return false
+}
+
+func stripRequirement(reqs []string, r string) []string {
+	out := make([]string, 0, len(reqs))
+	for _, v := range reqs {
+		if v != r {
+			out = append(out, v)
+		}
+	}
+	return out
 }

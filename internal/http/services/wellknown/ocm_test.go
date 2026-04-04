@@ -19,16 +19,25 @@
 package wellknown
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
-func TestInitWithCodeFlowEnabled(t *testing.T) {
+func initHandler(t *testing.T, c *OcmProviderConfig) *wkocmHandler {
+	t.Helper()
 	h := &wkocmHandler{}
-	h.init(&OcmProviderConfig{
+	if err := h.init(c); err != nil {
+		t.Fatalf("init failed: %v", err)
+	}
+	return h
+}
+
+func TestInitWithCodeFlowEnabled(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{
 		Endpoint:       "https://cernbox.cern.ch",
 		OCMPrefix:      "ocm",
-		EnableCodeFlow: true,
+		EnableTokenExchange: true,
 	})
 
 	if h.data.TokenEndPoint == "" {
@@ -51,11 +60,10 @@ func TestInitWithCodeFlowEnabled(t *testing.T) {
 }
 
 func TestInitWithCodeFlowDisabled(t *testing.T) {
-	h := &wkocmHandler{}
-	h.init(&OcmProviderConfig{
+	h := initHandler(t, &OcmProviderConfig{
 		Endpoint:       "https://cernbox.cern.ch",
 		OCMPrefix:      "ocm",
-		EnableCodeFlow: false,
+		EnableTokenExchange: false,
 	})
 
 	if h.data.TokenEndPoint != "" {
@@ -70,9 +78,8 @@ func TestInitWithCodeFlowDisabled(t *testing.T) {
 }
 
 func TestInitWithNoEndpoint(t *testing.T) {
-	h := &wkocmHandler{}
-	h.init(&OcmProviderConfig{
-		EnableCodeFlow: true,
+	h := initHandler(t, &OcmProviderConfig{
+		EnableTokenExchange: true,
 	})
 
 	if h.data.Enabled {
@@ -84,10 +91,9 @@ func TestInitWithNoEndpoint(t *testing.T) {
 }
 
 func TestInitCapabilitiesDoNotDuplicateExchangeToken(t *testing.T) {
-	h := &wkocmHandler{}
-	h.init(&OcmProviderConfig{
+	h := initHandler(t, &OcmProviderConfig{
 		Endpoint:       "https://cernbox.cern.ch",
-		EnableCodeFlow: true,
+		EnableTokenExchange: true,
 	})
 
 	count := 0
@@ -98,5 +104,87 @@ func TestInitCapabilitiesDoNotDuplicateExchangeToken(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 exchange-token capability, got %d in %v", count, h.data.Capabilities)
+	}
+}
+
+func TestCriteriaEmptyByDefault(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{
+		Endpoint:       "https://cernbox.cern.ch",
+		EnableTokenExchange: true,
+	})
+	if h.data.Criteria == nil {
+		t.Fatal("criteria must not be nil")
+	}
+	if len(h.data.Criteria) != 0 {
+		t.Errorf("expected empty criteria, got %v", h.data.Criteria)
+	}
+}
+
+func TestCriteriaTokenExchangeWhenStrict(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{
+		Endpoint:           "https://cernbox.cern.ch",
+		EnableTokenExchange:     true,
+		RequireTokenExchange: true,
+	})
+	found := false
+	for _, c := range h.data.Criteria {
+		if c == "token-exchange" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected token-exchange in criteria, got %v", h.data.Criteria)
+	}
+}
+
+func TestCriteriaSerializesAsEmptyArray(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{
+		Endpoint:       "https://cernbox.cern.ch",
+		EnableTokenExchange: false,
+	})
+	b, err := json.Marshal(h.data)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	if !strings.Contains(string(b), `"criteria":[]`) {
+		t.Errorf("expected criteria:[] in JSON, got %s", string(b))
+	}
+}
+
+func TestCriteriaRoundTrip(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{
+		Endpoint:           "https://cernbox.cern.ch",
+		EnableTokenExchange:     true,
+		RequireTokenExchange: true,
+	})
+	b, err := json.Marshal(h.data)
+	if err != nil {
+		t.Fatalf("marshal error: %v", err)
+	}
+	var out OcmDiscoveryData
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(out.Criteria) != 1 || out.Criteria[0] != "token-exchange" {
+		t.Errorf("round-trip criteria mismatch: got %v", out.Criteria)
+	}
+}
+
+func TestInitRejectsStrictnessWithoutCodeFlow(t *testing.T) {
+	h := &wkocmHandler{}
+	err := h.init(&OcmProviderConfig{
+		Endpoint:           "https://cernbox.cern.ch",
+		EnableTokenExchange:     false,
+		RequireTokenExchange: true,
+	})
+	if err == nil {
+		t.Fatal("expected error for strictness without code-flow")
+	}
+}
+
+func TestDisabledEndpointStillHasEmptyCriteria(t *testing.T) {
+	h := initHandler(t, &OcmProviderConfig{})
+	if h.data.Criteria == nil || len(h.data.Criteria) != 0 {
+		t.Errorf("expected empty criteria for disabled endpoint, got %v", h.data.Criteria)
 	}
 }
