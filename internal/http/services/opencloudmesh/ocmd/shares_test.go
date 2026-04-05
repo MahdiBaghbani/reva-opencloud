@@ -59,6 +59,7 @@ func (m *sharesMockGW) CreateOCMIncomingShare(context.Context, *ocmincoming.Crea
 
 func TestCreateShareReturnsServerErrorForNonOKCreateStatus(t *testing.T) {
 	h := &sharesHandler{
+		providerDomain: "local.example.org",
 		gatewayClient: &sharesMockGW{
 			createResp: &ocmincoming.CreateOCMIncomingShareResponse{
 				Status: &rpc.Status{

@@ -21,6 +21,7 @@ package ocmd
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/cs3org/reva/v3/pkg/appctx"
 	"github.com/cs3org/reva/v3/pkg/rhttp/global"
@@ -36,6 +37,7 @@ func init() {
 type config struct {
 	Prefix                     string                    `mapstructure:"prefix"`
 	GatewaySvc                 string                    `mapstructure:"gatewaysvc"                    validate:"required"`
+	ProviderDomain             string                    `mapstructure:"provider_domain"               validate:"required"`
 	ExposeRecipientDisplayName bool                      `mapstructure:"expose_recipient_display_name"`
 	TokenManager               string                    `mapstructure:"token_manager"`
 	TokenManagers              map[string]map[string]any `mapstructure:"token_managers"`
@@ -43,6 +45,7 @@ type config struct {
 
 func (c *config) ApplyDefaults() {
 	c.GatewaySvc = sharedconf.GetGatewaySVC(c.GatewaySvc)
+	c.ProviderDomain = strings.TrimSpace(c.ProviderDomain)
 	if c.Prefix == "" {
 		c.Prefix = "ocm"
 	}

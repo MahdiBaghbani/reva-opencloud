@@ -53,15 +53,17 @@ var validate = validator.New()
 type sharesHandler struct {
 	gatewayClient              gateway.GatewayAPIClient
 	exposeRecipientDisplayName bool
+	providerDomain             string
 }
 
 func (h *sharesHandler) init(c *config) error {
+	h.exposeRecipientDisplayName = c.ExposeRecipientDisplayName
+	h.providerDomain = c.ProviderDomain
 	var err error
 	h.gatewayClient, err = pool.GetGatewayServiceClient(pool.Endpoint(c.GatewaySvc))
 	if err != nil {
 		return err
 	}
-	h.exposeRecipientDisplayName = c.ExposeRecipientDisplayName
 	return nil
 }
 
