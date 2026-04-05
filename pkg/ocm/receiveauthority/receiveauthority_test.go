@@ -20,7 +20,7 @@ package receiveauthority
 
 import (
 	"encoding/json"
-	"strings"
+	"errors"
 	"testing"
 
 	typespb "github.com/cs3org/go-cs3apis/cs3/types/v1beta1"
@@ -147,6 +147,13 @@ func TestDecodeFromOpaqueMap(t *testing.T) {
 	if err == nil {
 		t.Fatal("empty semantic JSON under OpaqueKey should fail validate")
 	}
+
+	_, err = DecodeFromOpaqueMap(map[string]*typespb.OpaqueEntry{
+		OpaqueKey: nil,
+	})
+	if err == nil {
+		t.Fatal("nil OpaqueEntry under OpaqueKey should error")
+	}
 }
 
 func TestEncodeInvalidRecord(t *testing.T) {
@@ -184,12 +191,24 @@ func TestDecodeOpaqueEntryErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var probe Record
+	if err := json.Unmarshal(wrongCohort, &probe); err != nil {
+		t.Fatal(err)
+	}
+	wantValidateErr := probe.Validate()
+	if wantValidateErr == nil {
+		t.Fatal("probe must be semantically invalid")
+	}
 	_, decErr := DecodeOpaqueEntry(&typespb.OpaqueEntry{Decoder: OpaqueDecoder, Value: wrongCohort})
 	if decErr == nil {
 		t.Fatal("valid json invalid record should fail")
 	}
-	if !strings.Contains(decErr.Error(), "cohort") {
-		t.Fatalf("expected cohort error, got %v", decErr)
+	inner := errors.Unwrap(decErr)
+	if inner == nil {
+		t.Fatal("decode error should wrap validation failure with %w")
+	}
+	if inner.Error() != wantValidateErr.Error() {
+		t.Fatalf("unwrapped %q want same as Validate() %q", inner.Error(), wantValidateErr.Error())
 	}
 }
 

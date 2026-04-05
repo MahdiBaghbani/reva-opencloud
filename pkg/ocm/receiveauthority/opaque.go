@@ -66,14 +66,17 @@ func DecodeOpaqueEntry(e *typespb.OpaqueEntry) (*Record, error) {
 }
 
 // DecodeFromOpaqueMap returns the record from m[OpaqueKey], or (nil, nil) if the key is absent.
-// If the key is present but the entry is invalid JSON or fails Validate, it returns an error.
+// If the key is present with a nil entry, or the entry is invalid JSON or fails Validate, it returns an error.
 func DecodeFromOpaqueMap(m map[string]*typespb.OpaqueEntry) (*Record, error) {
 	if m == nil {
 		return nil, nil
 	}
 	e, ok := m[OpaqueKey]
-	if !ok || e == nil {
+	if !ok {
 		return nil, nil
+	}
+	if e == nil {
+		return nil, fmt.Errorf("receiveauthority: opaque map value for key %q is nil", OpaqueKey)
 	}
 	return DecodeOpaqueEntry(e)
 }
